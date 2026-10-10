@@ -1,0 +1,1653 @@
+--[[
+================================================================================
+ PROJECT ZERO - Blox Fruits Structure Extractor   v2.0
+================================================================================
+
+ Read-only, metadata-only snapshot of the CLIENT-ACCESSIBLE game structure.
+ It never reads Script / LocalScript / ModuleScript .Source (hard-blocked below).
+
+ WHAT'S NEW vs v1.2
+   * Streams one record per instance to a .jsonl file (no giant in-memory JSON,
+     no crashes on 200k+ instance games) and yields so the client doesn't freeze.
+   * Waits for the game to load + settle before scanning.
+   * Stable fingerprints: volatile data (health, GUI tweens, unanchored part
+     positions, playing sounds...) is excluded and numbers are rounded, so a
+     fingerprint only changes when the game ACTUALLY changes.
+     (v1 hashed positions/health, so every run looked "changed"; its FNV hash
+     also lost precision above 2^53.)
+   * Hierarchical Tree.txt with repeated siblings collapsed.
+   * Update diff: automatically compares against your previous run for the same
+     PlaceId and writes Diff.txt (added / removed / changed, grouped by top-most
+     container, plus class-count deltas).
+   * Analyzers: class histogram, largest containers, attribute names, enemy /
+     NPC groups, spawn points, map islands (position + size), GUI list, remotes
+     grouped by container, asset IDs (meshes, textures, sounds, animations).
+   * Scope control: skips other players' characters, Terrain/Camera internals,
+     only scans the LOCAL player under Players. Warns if StreamingEnabled makes
+     the snapshot position-dependent.
+   * Unique paths (duplicate sibling names get ~2, ~3 ...) so keys never collide.
+   * One folder per run:  ProjectZero_Extractor/Run_<UTC>_P<PlaceId>/
+
+ OUTPUT (per run folder)
+   Summary.txt      human-readable overview + warnings + diff headline
+   Snapshot.json    compact structured summary (analyzers, counts, remotes...)
+   Instances.jsonl  one JSON object per instance (full detail, grep-friendly)
+   Tree.txt         indented hierarchy (collapsed)
+   Scripts.txt      script / module manifest (no source)
+   Remotes.txt      remotes + bindables grouped by container
+   Tags.txt         CollectionService tags
+   Assets.txt       asset IDs and where they are used
+   Index.tsv        key / parent / class / hash   (used for the next diff)
+   Diff.txt         changes since the previous run (when one exists)
+
+ Edit CONFIG below to tune. Defaults are tuned for Blox Fruits.
+================================================================================
+]]
+
+local VERSION = "ProjectZero-StructureExtractor-2.0"
+
+----------------------------------------------------------------------
+-- SERVICES
+----------------------------------------------------------------------
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local CollectionService = game:GetService("CollectionService")
+local Workspace = game:GetService("Workspace")
+
+----------------------------------------------------------------------
+-- CONFIG
+----------------------------------------------------------------------
+local CONFIG = {
+	OutputFolder = "ProjectZero_Extractor",
+
+	-- Run behaviour
+	WaitForGameLoaded = true,
+	SettleSeconds = 2, -- extra wait after load so replication can finish
+	YieldEvery = 500, -- instances between yields (lower = smoother, slower)
+	ProgressEvery = 20000,
+	MaxInstances = 600000, -- hard safety cap
+	MaxDepth = 100,
+
+	-- Privacy
+	RedactPlayerInfo = false, -- replace your username / display name in outputs
+
+	-- Detail
+	RecordProperties = true, -- per-instance useful properties (parts, GUIs, values...)
+	RecordTextProperties = true, -- TextLabel/TextButton/TextBox .Text
+	SkipPlayerCharacters = true, -- record the character model but don't descend
+	NoDescendClasses = { Terrain = true, Camera = true },
+
+	-- Tree.txt
+	TreeMaxDepth = 5,
+	TreeGroupLimit = 3, -- show at most N siblings sharing the same Name+Class
+
+	-- Largest-containers analysis
+	ShallowDepth = 3,
+	TopContainers = 30,
+
+	-- Limits for text reports
+	TopClasses = 40,
+	MaxAssets = 60000,
+	TopAssetsInJson = 2000,
+	DiffListLimit = 300,
+
+	-- Diff: dynamic areas that would only add noise (matched as path prefixes)
+	DiffIgnorePrefixes = {
+		"Players",
+		"Workspace.Enemies",
+		"Workspace.Characters",
+		"Workspace.Boats",
+		"Workspace.SeaBeasts",
+		"Workspace.Camera",
+	},
+
+	Services = {
+		"Workspace",
+		"ReplicatedStorage",
+		"ReplicatedFirst",
+		"Lighting",
+		"SoundService",
+		"StarterGui",
+		"StarterPack",
+		"StarterPlayer",
+		"Teams",
+		"TextChatService",
+		"MaterialService",
+		"Players", -- local player only
+	},
+
+	-- Dotted paths from `game`. Missing ones are reported as not found.
+	KnownContainers = {
+		"Workspace.Map",
+		"Workspace.Enemies",
+		"Workspace.NPCs",
+		"Workspace.Characters",
+		"Workspace.Boats",
+		"Workspace.SeaBeasts",
+		"Workspace._WorldOrigin",
+		"Workspace._WorldOrigin.EnemySpawns",
+		"ReplicatedStorage.Remotes",
+		"ReplicatedStorage.Modules",
+	},
+	EntityContainers = { "Workspace.Enemies", "Workspace.NPCs", "Workspace.SeaBeasts" },
+	SpawnContainers = { "Workspace._WorldOrigin.EnemySpawns" },
+	MapContainers = { "Workspace.Map" },
+}
+
+----------------------------------------------------------------------
+-- EXECUTOR API
+----------------------------------------------------------------------
+local HAS = {
+	writefile = type(writefile) == "function",
+	appendfile = type(appendfile) == "function",
+	readfile = type(readfile) == "function",
+	isfile = type(isfile) == "function",
+	isfolder = type(isfolder) == "function",
+	makefolder = type(makefolder) == "function",
+	listfiles = type(listfiles) == "function",
+}
+
+----------------------------------------------------------------------
+-- SMALL HELPERS (no per-call closures in hot paths)
+----------------------------------------------------------------------
+local function yieldNow()
+	if task and task.wait then
+		task.wait()
+	else
+		wait()
+	end
+end
+
+local function index(obj, key) return obj[key] end
+local function callGetChildren(i) return i:GetChildren() end
+local function callGetAttributes(i) return i:GetAttributes() end
+local function callGetTags(i) return i:GetTags() end
+local function callGetFullName(i) return i:GetFullName() end
+local function callIsA(i, className) return i:IsA(className) end
+local function callGetPivot(i) return i:GetPivot() end
+
+local function round3(n)
+	if n ~= n then return "NaN" end
+	if n == math.huge then return "Infinity" end
+	if n == -math.huge then return "-Infinity" end
+	return math.floor(n * 1000 + 0.5) / 1000
+end
+
+local function cleanString(s)
+	s = tostring(s)
+	if utf8 and utf8.len and not utf8.len(s) then
+		s = string.gsub(s, "[\128-\255]", "?")
+	end
+	return (string.gsub(s, "%c", " "))
+end
+
+local function truncate(s, maxLen)
+	s = tostring(s)
+	if #s > maxLen then s = string.sub(s, 1, maxLen) end
+	return cleanString(s)
+end
+
+local function safeFullName(inst)
+	local ok, r = pcall(callGetFullName, inst)
+	if ok then return cleanString(r) end
+	return cleanString(inst.Name)
+end
+
+local function sortedKeys(t)
+	local keys = {}
+	for k in pairs(t) do keys[#keys + 1] = k end
+	table.sort(keys, function(a, b) return tostring(a) < tostring(b) end)
+	return keys
+end
+
+local function joinKeys(t, limit)
+	local keys = sortedKeys(t)
+	local out = {}
+	for i = 1, math.min(#keys, limit) do out[i] = tostring(keys[i]) end
+	local text = table.concat(out, ",")
+	if #keys > limit then text ..= ",+" .. (#keys - limit) end
+	return text
+end
+
+-- Stable FNV-1a (32 bit). h*16777619 is split so it never exceeds 2^53.
+local function fnv1a(s)
+	local h = 2166136261
+	for i = 1, #s do
+		h = bit32.bxor(h, string.byte(s, i))
+		h = (bit32.lshift(h, 24) + h * 403) % 4294967296
+	end
+	return string.format("%08x", h)
+end
+
+-- Deterministic string form of a (serialized) value, independent of pairs() order.
+local function canon(value)
+	if type(value) == "table" then
+		local keys = sortedKeys(value)
+		local parts = table.create(#keys)
+		for i, k in ipairs(keys) do
+			parts[i] = tostring(k) .. "=" .. canon(value[k])
+		end
+		return "{" .. table.concat(parts, ",") .. "}"
+	end
+	return tostring(value)
+end
+
+----------------------------------------------------------------------
+-- JSON SAFETY NET (only used if a plain encode fails)
+----------------------------------------------------------------------
+local function sanitizeForJSON(value, depth, seen)
+	depth = depth or 0
+	seen = seen or {}
+	local t = type(value)
+	if t == "number" then
+		if value ~= value or value == math.huge or value == -math.huge then return tostring(value) end
+		return value
+	elseif t == "string" then
+		return cleanString(value)
+	elseif t == "boolean" then
+		return value
+	elseif t == "table" then
+		if depth > 40 then return "<depth-limit>" end
+		if seen[value] then return "<recursive>" end
+		seen[value] = true
+		local out = {}
+		local isArray, n = true, 0
+		for k in pairs(value) do
+			n += 1
+			if type(k) ~= "number" then isArray = false end
+		end
+		if isArray and n == #value then
+			for i = 1, n do
+				local v = sanitizeForJSON(value[i], depth + 1, seen)
+				out[i] = v == nil and "<nil>" or v
+			end
+		else
+			for k, v in pairs(value) do
+				local sv = sanitizeForJSON(v, depth + 1, seen)
+				out[cleanString(k)] = sv == nil and "<nil>" or sv
+			end
+		end
+		seen[value] = nil
+		return out
+	elseif t == "nil" then
+		return nil
+	end
+	return cleanString(tostring(value))
+end
+
+local function encodeJSON(data)
+	local ok, result = pcall(HttpService.JSONEncode, HttpService, data)
+	if ok then return result, nil end
+	local ok2, result2 = pcall(HttpService.JSONEncode, HttpService, sanitizeForJSON(data))
+	if ok2 then return result2, nil end
+	return nil, tostring(result2)
+end
+
+----------------------------------------------------------------------
+-- VALUE SERIALIZATION (compact + rounded so diffs stay stable)
+--   Vector3 -> [x,y,z]   Color3 -> "#rrggbb"   Enum -> "Name"   Instance -> "@path"
+----------------------------------------------------------------------
+local function toHex(c)
+	local function ch(v) return math.clamp(math.floor(v * 255 + 0.5), 0, 255) end
+	return string.format("#%02x%02x%02x", ch(c.R), ch(c.G), ch(c.B))
+end
+
+local function serializeValue(value)
+	local t = typeof(value)
+	if t == "number" then
+		return round3(value)
+	elseif t == "string" then
+		return truncate(value, 300)
+	elseif t == "boolean" then
+		return value
+	elseif t == "Vector3" then
+		return { round3(value.X), round3(value.Y), round3(value.Z) }
+	elseif t == "Vector2" then
+		return { round3(value.X), round3(value.Y) }
+	elseif t == "Color3" then
+		return toHex(value)
+	elseif t == "CFrame" then
+		local rx, ry, rz = value:ToOrientation()
+		return {
+			p = { round3(value.X), round3(value.Y), round3(value.Z) },
+			r = { round3(math.deg(rx)), round3(math.deg(ry)), round3(math.deg(rz)) },
+		}
+	elseif t == "UDim2" then
+		return { round3(value.X.Scale), value.X.Offset, round3(value.Y.Scale), value.Y.Offset }
+	elseif t == "UDim" then
+		return { round3(value.Scale), value.Offset }
+	elseif t == "NumberRange" then
+		return { round3(value.Min), round3(value.Max) }
+	elseif t == "BrickColor" or t == "EnumItem" then
+		return value.Name
+	elseif t == "Instance" then
+		return "@" .. safeFullName(value)
+	elseif t == "nil" then
+		return nil
+	end
+	return truncate(tostring(value), 200)
+end
+
+----------------------------------------------------------------------
+-- PROPERTY SPECS (table-driven; resolved once per ClassName via IsA)
+-- Volatile = recorded, but excluded from the change fingerprint.
+----------------------------------------------------------------------
+local PROPERTY_SPECS = {
+	{ Class = "BasePart", Props = { "Position", "Orientation", "Size", "Anchored", "CanCollide", "CanTouch", "CanQuery", "Transparency", "Material", "Color", "Massless", "CollisionGroup" } },
+	{ Class = "Part", Props = { "Shape" } },
+	{ Class = "MeshPart", Props = { "MeshId", "TextureID" } },
+	{ Class = "SpecialMesh", Props = { "MeshId", "TextureId", "MeshType" } },
+	{ Class = "Decal", Props = { "Texture" } },
+	{ Class = "Model", Props = { "PrimaryPart" } },
+	{ Class = "Humanoid", Props = { "MaxHealth", "Health", "WalkSpeed", "JumpPower", "HipHeight", "RigType" }, Volatile = { Health = true } },
+	{ Class = "Tool", Props = { "ToolTip", "CanBeDropped", "RequiresHandle" } },
+	{ Class = "ProximityPrompt", Props = { "ActionText", "ObjectText", "HoldDuration", "MaxActivationDistance", "RequiresLineOfSight", "Enabled" } },
+	{ Class = "ClickDetector", Props = { "MaxActivationDistance" } },
+	{ Class = "Sound", Props = { "SoundId", "Volume", "PlaybackSpeed", "Looped", "Playing" }, Volatile = { Playing = true } },
+	{ Class = "Animation", Props = { "AnimationId" } },
+	{ Class = "ParticleEmitter", Props = { "Texture", "Rate", "Enabled" } },
+	{ Class = "Light", Props = { "Brightness", "Range", "Enabled", "Color" } },
+	{ Class = "ScreenGui", Props = { "Enabled", "DisplayOrder", "ResetOnSpawn" } },
+	{ Class = "GuiObject", Props = { "Visible", "Position", "Size", "AnchorPoint", "BackgroundTransparency" }, Volatile = { Visible = true, Position = true, Size = true, BackgroundTransparency = true } },
+	{ Class = "TextLabel", Props = { "Text" }, Volatile = { Text = true } },
+	{ Class = "TextButton", Props = { "Text" }, Volatile = { Text = true } },
+	{ Class = "TextBox", Props = { "Text" }, Volatile = { Text = true } },
+	{ Class = "ImageLabel", Props = { "Image" } },
+	{ Class = "ImageButton", Props = { "Image" } },
+	{ Class = "ValueBase", Props = { "Value" } },
+	{ Class = "BaseScript", Props = { "Disabled" } },
+	{ Class = "Script", Props = { "RunContext" } },
+	{ Class = "Lighting", Props = { "Brightness", "Ambient", "OutdoorAmbient", "FogStart", "FogEnd", "FogColor", "GlobalShadows", "Technology", "ClockTime" }, Volatile = { ClockTime = true } },
+	{ Class = "Workspace", Props = { "Gravity", "StreamingEnabled", "FallenPartsDestroyHeight" } },
+}
+
+local ASSET_PROPS = { SoundId = true, AnimationId = true, MeshId = true, TextureID = true, TextureId = true, Texture = true, Image = true }
+
+-- Hard guarantee: script source is never read, whatever gets added to the specs.
+local FORBIDDEN_PROPS = { Source = true }
+
+local specCache = {}
+local function specsFor(inst, className)
+	local cached = specCache[className]
+	if cached then return cached end
+	local list = {}
+	for _, spec in ipairs(PROPERTY_SPECS) do
+		local ok, isA = pcall(callIsA, inst, spec.Class)
+		if ok and isA then list[#list + 1] = spec end
+	end
+	specCache[className] = list
+	return list
+end
+
+local classFlagCache = {}
+local function classFlags(inst, className)
+	local f = classFlagCache[className]
+	if f then return f end
+	local function isA(c)
+		local ok, r = pcall(callIsA, inst, c)
+		return ok and r == true
+	end
+	f = { part = isA("BasePart"), gui = isA("GuiObject"), value = isA("ValueBase"), sound = isA("Sound"), anim = isA("Animation") }
+	classFlagCache[className] = f
+	return f
+end
+
+local function buildProps(inst, className, structuralOnly)
+	if not CONFIG.RecordProperties then return nil, nil, nil end
+	local specs = specsFor(inst, className)
+	if #specs == 0 then return nil, nil, nil end
+
+	local props, hashProps, assets
+	for _, spec in ipairs(specs) do
+		local volatile = spec.Volatile
+		for _, propName in ipairs(spec.Props) do
+			if not FORBIDDEN_PROPS[propName] and not (propName == "Text" and not CONFIG.RecordTextProperties) then
+				local ok, raw = pcall(index, inst, propName)
+				if ok and raw ~= nil then
+					local value = serializeValue(raw)
+					if value ~= nil then
+						props = props or {}
+						props[propName] = value
+						if not structuralOnly and not (volatile and volatile[propName]) then
+							hashProps = hashProps or {}
+							hashProps[propName] = value
+						end
+						if ASSET_PROPS[propName] and type(value) == "string" and value ~= "" then
+							assets = assets or {}
+							assets[#assets + 1] = { propName, value }
+						end
+					end
+				end
+			end
+		end
+	end
+
+	-- Unanchored parts move: their transform must not influence the fingerprint.
+	if hashProps and props and props.Anchored == false then
+		hashProps.Position = nil
+		hashProps.Orientation = nil
+	end
+	return props, hashProps, assets
+end
+
+----------------------------------------------------------------------
+-- FILE OUTPUT
+----------------------------------------------------------------------
+local function ensureFolder(path)
+	if not HAS.isfolder or not HAS.makefolder then return false end
+	local ok, exists = pcall(isfolder, path)
+	if ok and exists then return true end
+	pcall(makefolder, path)
+	local ok2, now = pcall(isfolder, path)
+	return ok2 and now == true
+end
+
+local function newStream(path)
+	local stream = { path = path, buffer = {}, held = {}, lines = 0, bytes = 0, ok = true, err = nil }
+	if HAS.writefile then
+		local ok, err = pcall(writefile, path, "")
+		if not ok then stream.ok, stream.err = false, tostring(err) end
+	else
+		stream.ok, stream.err = false, "writefile unavailable"
+	end
+
+	local function flush()
+		if #stream.buffer == 0 then return end
+		local chunk = table.concat(stream.buffer, "\n") .. "\n"
+		stream.buffer = {}
+		if not stream.ok then return end
+		if HAS.appendfile then
+			local ok, err = pcall(appendfile, stream.path, chunk)
+			if not ok then stream.ok, stream.err = false, tostring(err) end
+		else
+			stream.held[#stream.held + 1] = chunk
+		end
+	end
+
+	function stream.add(line)
+		stream.buffer[#stream.buffer + 1] = line
+		stream.lines += 1
+		stream.bytes += #line + 1
+		if #stream.buffer >= 1000 then flush() end
+	end
+
+	function stream.close()
+		flush()
+		if stream.ok and not HAS.appendfile then
+			local ok, err = pcall(writefile, stream.path, table.concat(stream.held))
+			if not ok then stream.ok, stream.err = false, tostring(err) end
+			stream.held = {}
+		end
+		return stream.ok, stream.err
+	end
+
+	return stream
+end
+
+----------------------------------------------------------------------
+-- SCAN STATE
+----------------------------------------------------------------------
+local ctx = { LocalPlayer = nil, playerNames = {} }
+
+local state = {
+	count = 0,
+	truncated = false,
+	skippedCharacters = 0,
+	recordErrors = 0,
+	errorSamples = {},
+	jsonErrors = 0,
+	keys = {},
+	trees = {},
+	instStream = nil,
+}
+
+local cur = { hash = {}, parent = {}, class = {} } -- current-run index (for diff)
+local classHist, attrStats, tagMap, assetMap = {}, {}, {}, {}
+local assetKeyCount = 0
+local scriptList, remoteList = {}, {}
+local shallow, shallowByPath = {}, {}
+
+local counts = {
+	Instances = 0, Models = 0, Folders = 0, BaseParts = 0, GuiObjects = 0, ValueObjects = 0,
+	Sounds = 0, Animations = 0,
+	Scripts = 0, LocalScripts = 0, ModuleScripts = 0, ServerScriptsVisibleToClient = 0,
+	RemoteEvents = 0, RemoteFunctions = 0, Bindables = 0,
+	ProximityPrompts = 0, ClickDetectors = 0,
+}
+
+local function segmentName(raw)
+	local nm = cleanString(raw)
+	if CONFIG.RedactPlayerInfo and ctx.playerNames[nm] then return "<LocalPlayer>" end
+	return nm
+end
+
+local function newTreeNode(name, className)
+	return { name = name, class = className, children = 0, desc = 0, groups = {}, order = {} }
+end
+
+----------------------------------------------------------------------
+-- ATTRIBUTES / TAGS
+----------------------------------------------------------------------
+local function getAttributes(inst, path)
+	local ok, attrs = pcall(callGetAttributes, inst)
+	if not ok or type(attrs) ~= "table" then return nil end
+	local out, any = {}, false
+	for name, value in pairs(attrs) do
+		local sv = serializeValue(value)
+		if sv ~= nil then
+			local cname = cleanString(name)
+			out[cname] = sv
+			any = true
+			if path then
+				local a = attrStats[cname]
+				if not a then
+					attrStats[cname] = { count = 1, valueType = typeof(value), sample = path }
+				else
+					a.count += 1
+				end
+			end
+		end
+	end
+	if any then return out end
+	return nil
+end
+
+local function getTags(inst)
+	local ok, tags = pcall(callGetTags, inst)
+	if not ok then ok, tags = pcall(CollectionService.GetTags, CollectionService, inst) end
+	if not ok or type(tags) ~= "table" or #tags == 0 then return nil end
+	for i, tag in ipairs(tags) do tags[i] = cleanString(tag) end
+	table.sort(tags)
+	return tags
+end
+
+----------------------------------------------------------------------
+-- RECORD ONE INSTANCE
+----------------------------------------------------------------------
+local function recordInstance(inst, path, parentPath, name, depth, rootName, className, childCount, skipReason, structuralOnly)
+	local flags = classFlags(inst, className)
+	local attrs = getAttributes(inst, path)
+	local tags = getTags(inst)
+	local props, hashProps, assets = buildProps(inst, className, structuralOnly)
+
+	-- Fingerprint = attrs/tags half + class/props half. Name is part of the key.
+	local aHash, pHash
+	if structuralOnly then
+		aHash = "00000000"
+		pHash = fnv1a(className)
+	else
+		local aStr = (attrs and canon(attrs) or "") .. (tags and table.concat(tags, ",") or "")
+		aHash = aStr == "" and "00000000" or fnv1a(aStr)
+		pHash = fnv1a(className .. (hashProps and canon(hashProps) or ""))
+	end
+	local hash = aHash .. pHash
+
+	-- counts
+	counts.Instances += 1
+	classHist[className] = (classHist[className] or 0) + 1
+	if className == "Model" then
+		counts.Models += 1
+	elseif className == "Folder" then
+		counts.Folders += 1
+	end
+	if flags.part then counts.BaseParts += 1 end
+	if flags.gui then counts.GuiObjects += 1 end
+	if flags.value then counts.ValueObjects += 1 end
+	if flags.sound then counts.Sounds += 1 end
+	if flags.anim then counts.Animations += 1 end
+
+	-- scripts (metadata only)
+	if className == "Script" or className == "LocalScript" or className == "ModuleScript" then
+		counts.Scripts += 1
+		if className == "Script" then
+			counts.ServerScriptsVisibleToClient += 1
+		elseif className == "LocalScript" then
+			counts.LocalScripts += 1
+		else
+			counts.ModuleScripts += 1
+		end
+		scriptList[#scriptList + 1] = {
+			Path = path, Class = className, Root = rootName,
+			Disabled = props and props.Disabled or nil,
+			RunContext = props and props.RunContext or nil,
+		}
+	end
+
+	-- remotes / bindables
+	if className == "RemoteEvent" or className == "UnreliableRemoteEvent" or className == "RemoteFunction"
+		or className == "BindableEvent" or className == "BindableFunction" then
+		remoteList[#remoteList + 1] = { Path = path, Parent = parentPath or "", Name = name, Class = className }
+		if className == "RemoteFunction" then
+			counts.RemoteFunctions += 1
+		elseif className == "BindableEvent" or className == "BindableFunction" then
+			counts.Bindables += 1
+		else
+			counts.RemoteEvents += 1
+		end
+	end
+
+	if className == "ProximityPrompt" then
+		counts.ProximityPrompts += 1
+	elseif className == "ClickDetector" then
+		counts.ClickDetectors += 1
+	end
+
+	-- tags
+	if tags then
+		for _, tag in ipairs(tags) do
+			local t = tagMap[tag]
+			if not t then
+				t = { count = 0, samples = {} }
+				tagMap[tag] = t
+			end
+			t.count += 1
+			if #t.samples < 20 then t.samples[#t.samples + 1] = path end
+		end
+	end
+
+	-- assets
+	if assets then
+		for _, a in ipairs(assets) do
+			local id = a[2]
+			local e = assetMap[id]
+			if e then
+				e.count += 1
+			elseif assetKeyCount < CONFIG.MaxAssets then
+				assetKeyCount += 1
+				assetMap[id] = { count = 1, class = className, prop = a[1], sample = path }
+			end
+		end
+	end
+
+	-- index for the next diff (skipped characters are dynamic -> not indexed)
+	if skipReason ~= "character" then
+		state.keys[#state.keys + 1] = path
+		cur.hash[path] = hash
+		cur.parent[path] = parentPath or ""
+		cur.class[path] = className
+	end
+
+	-- full record -> jsonl
+	local record = {
+		path = path, name = name, class = className, depth = depth, root = rootName,
+		children = childCount, skipped = skipReason, attrs = attrs, tags = tags, props = props, hash = hash,
+	}
+	local ok, line = pcall(HttpService.JSONEncode, HttpService, record)
+	if not ok then
+		local ok2, line2 = pcall(HttpService.JSONEncode, HttpService, sanitizeForJSON(record))
+		if ok2 then
+			line = line2
+		else
+			state.jsonErrors += 1
+			line = nil
+		end
+	end
+	if line then state.instStream.add(line) end
+
+	return attrs, tags
+end
+
+----------------------------------------------------------------------
+-- RECURSIVE VISIT (returns subtree size)
+----------------------------------------------------------------------
+local function visit(inst, path, parentPath, name, depth, rootName, structuralOnly, treeNode)
+	if state.count >= CONFIG.MaxInstances then
+		state.truncated = true
+		return 0
+	end
+	state.count += 1
+	local n = state.count
+	if n % CONFIG.YieldEvery == 0 then yieldNow() end
+	if n % CONFIG.ProgressEvery == 0 then
+		print(("[Project Zero] ...scanned %d instances"):format(n))
+	end
+
+	local className = inst.ClassName
+
+	-- should we descend?
+	local skipReason = nil
+	if CONFIG.NoDescendClasses[className] then
+		skipReason = "class"
+	elseif CONFIG.SkipPlayerCharacters and className == "Model" and depth <= 3 and rootName == "Workspace" then
+		local ok, plr = pcall(Players.GetPlayerFromCharacter, Players, inst)
+		if ok and plr then
+			skipReason = "character"
+			state.skippedCharacters += 1
+		end
+	end
+
+	local kids = {}
+	local okKids, result = pcall(callGetChildren, inst)
+	if okKids then kids = result end
+	local childCount = #kids
+	if skipReason or depth >= CONFIG.MaxDepth then kids = {} end
+
+	-- shallow stats (largest containers / known containers)
+	local rec
+	if depth <= CONFIG.ShallowDepth then
+		rec = { path = path, class = className, children = childCount, desc = 0 }
+		shallow[#shallow + 1] = rec
+		shallowByPath[path] = rec
+	end
+
+	local okRec, attrs, tags = pcall(recordInstance, inst, path, parentPath, name, depth, rootName, className, childCount, skipReason, structuralOnly)
+	if not okRec then
+		state.recordErrors += 1
+		if #state.errorSamples < 15 then
+			state.errorSamples[#state.errorSamples + 1] = path .. " :: " .. tostring(attrs)
+		end
+		attrs, tags = nil, nil
+	end
+
+	if treeNode then
+		treeNode.children = childCount
+		if tags then treeNode.tagText = table.concat(tags, ",") end
+		if attrs then treeNode.attrText = joinKeys(attrs, 5) end
+	end
+
+	local total = 1
+	if #kids > 0 then
+		local seen = {}
+		for _, child in ipairs(kids) do
+			local childName = segmentName(child.Name)
+			local c = (seen[childName] or 0) + 1
+			seen[childName] = c
+			local segment = c > 1 and (childName .. "~" .. c) or childName
+
+			local childTree = nil
+			if treeNode and depth < CONFIG.TreeMaxDepth then
+				local gkey = childName .. "|" .. child.ClassName
+				local g = treeNode.groups[gkey]
+				if not g then
+					g = { name = childName, class = child.ClassName, count = 0, nodes = {} }
+					treeNode.groups[gkey] = g
+					treeNode.order[#treeNode.order + 1] = gkey
+				end
+				g.count += 1
+				if g.count <= CONFIG.TreeGroupLimit then
+					childTree = newTreeNode(childName, child.ClassName)
+					g.nodes[#g.nodes + 1] = childTree
+				end
+			end
+
+			total += visit(child, path .. "." .. segment, path, childName, depth + 1, rootName, structuralOnly, childTree)
+		end
+	end
+
+	if rec then rec.desc = total - 1 end
+	if treeNode then treeNode.desc = total - 1 end
+	return total
+end
+
+local function scanRoot(inst, rootName, basePath, structuralOnly)
+	local name = string.match(basePath, "([^%.]+)$") or basePath
+	local tree = newTreeNode(basePath, inst.ClassName)
+	state.trees[#state.trees + 1] = tree
+	local before = state.count
+	visit(inst, basePath, nil, name, 0, rootName, structuralOnly, tree)
+	return { Available = true, Instances = state.count - before }
+end
+
+----------------------------------------------------------------------
+-- ANALYZERS (live queries after the scan)
+----------------------------------------------------------------------
+local function resolvePath(dotted)
+	local node
+	local first = true
+	for seg in string.gmatch(dotted, "[^%.]+") do
+		if first then
+			local ok, svc = pcall(game.GetService, game, seg)
+			node = ok and svc or game:FindFirstChild(seg)
+			first = false
+		else
+			node = node and node:FindFirstChild(seg)
+		end
+		if not node then return nil end
+	end
+	return node
+end
+
+local function pivotOf(inst)
+	local ok, cf = pcall(callGetPivot, inst)
+	if ok and cf then return serializeValue(cf.Position) end
+	return nil
+end
+
+local function sizeOf(inst)
+	if inst:IsA("BasePart") then return serializeValue(inst.Size) end
+	if inst:IsA("Model") then
+		local ok, _, size = pcall(function() return inst:GetBoundingBox() end)
+		if ok and size then return serializeValue(size) end
+	end
+	return nil
+end
+
+local function childrenOf(inst)
+	local ok, kids = pcall(callGetChildren, inst)
+	if ok then return kids end
+	return {}
+end
+
+local function containerInfo(dotted)
+	local inst = resolvePath(dotted)
+	if not inst then return { Path = dotted, Exists = false } end
+	local rec = shallowByPath[dotted]
+	local kids = childrenOf(inst)
+	local names, seen = {}, {}
+	for _, k in ipairs(kids) do
+		if #names >= 60 then break end
+		local nm = cleanString(k.Name)
+		if not seen[nm] then
+			seen[nm] = true
+			names[#names + 1] = nm
+		end
+	end
+	table.sort(names)
+	return {
+		Path = dotted, Exists = true, Class = inst.ClassName,
+		Children = #kids, Descendants = rec and rec.desc or nil, ChildNames = names,
+	}
+end
+
+local function summarizeEntities(dotted)
+	local container = resolvePath(dotted)
+	if not container then return { Path = dotted, Exists = false } end
+	local groups, order, total = {}, {}, 0
+	for i, child in ipairs(childrenOf(container)) do
+		if i % 200 == 0 then yieldNow() end
+		total += 1
+		local nm = cleanString(child.Name)
+		local g = groups[nm]
+		if not g then
+			g = { Name = nm, Class = child.ClassName, Count = 0, Position = pivotOf(child) }
+			local okH, hum = pcall(function() return child:FindFirstChildOfClass("Humanoid") end)
+			if okH and hum then
+				local okM, mh = pcall(index, hum, "MaxHealth")
+				if okM then g.MaxHealth = serializeValue(mh) end
+			end
+			g.Attributes = getAttributes(child, nil)
+			g.Tags = getTags(child)
+			groups[nm] = g
+			order[#order + 1] = nm
+		end
+		g.Count += 1
+	end
+	table.sort(order)
+	local list = {}
+	for _, nm in ipairs(order) do list[#list + 1] = groups[nm] end
+	return { Path = dotted, Exists = true, TotalChildren = total, DistinctNames = #list, Groups = list }
+end
+
+local function summarizeSpawns(dotted)
+	local container = resolvePath(dotted)
+	if not container then return { Path = dotted, Exists = false } end
+	local groups, order, total = {}, {}, 0
+	for i, child in ipairs(childrenOf(container)) do
+		if i % 200 == 0 then yieldNow() end
+		total += 1
+		local nm = cleanString(child.Name)
+		local g = groups[nm]
+		if not g then
+			g = { Name = nm, Class = child.ClassName, Count = 0, Positions = {} }
+			groups[nm] = g
+			order[#order + 1] = nm
+		end
+		g.Count += 1
+		if #g.Positions < 12 then
+			local p = pivotOf(child)
+			if p then g.Positions[#g.Positions + 1] = p end
+		end
+	end
+	table.sort(order)
+	local list = {}
+	for _, nm in ipairs(order) do list[#list + 1] = groups[nm] end
+	return { Path = dotted, Exists = true, TotalChildren = total, DistinctNames = #list, Groups = list }
+end
+
+local function summarizeMap(dotted)
+	local container = resolvePath(dotted)
+	if not container then return { Path = dotted, Exists = false } end
+	local entries = {}
+	local kids = childrenOf(container)
+	for i, child in ipairs(kids) do
+		if #entries >= 300 then break end
+		if i % 15 == 0 then yieldNow() end
+		local okD, descs = pcall(function() return #child:GetDescendants() end)
+		entries[#entries + 1] = {
+			Name = cleanString(child.Name), Class = child.ClassName,
+			Descendants = okD and descs or nil,
+			Position = pivotOf(child), Size = sizeOf(child),
+		}
+	end
+	table.sort(entries, function(a, b) return a.Name < b.Name end)
+	return { Path = dotted, Exists = true, TotalChildren = #kids, Entries = entries }
+end
+
+local function summarizeGuis()
+	local out = {}
+	local pg = ctx.LocalPlayer and ctx.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if not pg then return out end
+	for _, gui in ipairs(childrenOf(pg)) do
+		local entry = { Name = cleanString(gui.Name), Class = gui.ClassName }
+		if gui:IsA("ScreenGui") then
+			entry.Enabled = gui.Enabled
+			entry.DisplayOrder = gui.DisplayOrder
+			entry.ResetOnSpawn = gui.ResetOnSpawn
+		end
+		local okD, d = pcall(function() return #gui:GetDescendants() end)
+		entry.Descendants = okD and d or nil
+		out[#out + 1] = entry
+	end
+	table.sort(out, function(a, b) return a.Name < b.Name end)
+	return out
+end
+
+----------------------------------------------------------------------
+-- DIFF AGAINST PREVIOUS RUN
+----------------------------------------------------------------------
+local function isIgnored(key)
+	for _, p in ipairs(CONFIG.DiffIgnorePrefixes) do
+		if key == p or string.sub(key, 1, #p + 1) == p .. "." then return true end
+	end
+	return false
+end
+
+local function parseIndex(content)
+	local idx = { hash = {}, parent = {}, class = {}, classCount = {}, count = 0 }
+	for line in string.gmatch(content, "[^\n]+") do
+		if string.sub(line, 1, 1) ~= "#" then
+			local key, parent, cls, hash = string.match(line, "^([^\t]*)\t([^\t]*)\t([^\t]*)\t(%x+)$")
+			if key then
+				idx.hash[key] = hash
+				idx.parent[key] = parent
+				idx.class[key] = cls
+				idx.classCount[cls] = (idx.classCount[cls] or 0) + 1
+				idx.count += 1
+			end
+		end
+	end
+	return idx
+end
+
+local function findPreviousRun(currentRunName, placeId)
+	if not HAS.listfiles or not HAS.readfile or not HAS.isfile then return nil end
+	local ok, files = pcall(listfiles, CONFIG.OutputFolder)
+	if not ok or type(files) ~= "table" then return nil end
+	local candidates = {}
+	for _, f in ipairs(files) do
+		local norm = string.gsub(f, "\\", "/")
+		local runName = string.match(norm, "(Run_[%d%-_]+_P" .. tostring(placeId) .. ")$")
+		if runName and runName ~= currentRunName then
+			candidates[#candidates + 1] = { run = runName, folder = f }
+		end
+	end
+	table.sort(candidates, function(a, b) return a.run > b.run end)
+	for _, c in ipairs(candidates) do
+		local idxPath = c.folder .. "/Index.tsv"
+		local okF, exists = pcall(isfile, idxPath)
+		if okF and exists then return c.run, idxPath end
+	end
+	return nil
+end
+
+local function topMost(list, set, parentMap)
+	local tops, groupCount = {}, {}
+	for _, key in ipairs(list) do
+		local p = key
+		for _ = 1, 200 do
+			local parent = parentMap[p]
+			if parent and parent ~= "" and set[parent] then p = parent else break end
+		end
+		if p == key then tops[#tops + 1] = key end
+		groupCount[p] = (groupCount[p] or 0) + 1
+	end
+	table.sort(tops)
+	return tops, groupCount
+end
+
+local function computeDiff(prev)
+	local diff = { added = {}, removed = {}, changed = {}, ignored = 0 }
+	local curCounts, prevCounts = {}, {}
+	for i, key in ipairs(state.keys) do
+		if i % 20000 == 0 then yieldNow() end
+		if isIgnored(key) then
+			diff.ignored += 1
+		else
+			local cls = cur.class[key]
+			curCounts[cls] = (curCounts[cls] or 0) + 1
+			local ph = prev.hash[key]
+			if not ph then
+				diff.added[#diff.added + 1] = key
+			elseif ph ~= cur.hash[key] then
+				diff.changed[#diff.changed + 1] = key
+			end
+		end
+	end
+	local n = 0
+	for key in pairs(prev.hash) do
+		n += 1
+		if n % 20000 == 0 then yieldNow() end
+		if not isIgnored(key) then
+			local pcls = prev.class[key]
+			prevCounts[pcls] = (prevCounts[pcls] or 0) + 1
+			if cur.hash[key] == nil and not state.truncated then
+				diff.removed[#diff.removed + 1] = key
+			end
+		end
+	end
+	table.sort(diff.changed)
+
+	local addedSet, removedSet = {}, {}
+	for _, k in ipairs(diff.added) do addedSet[k] = true end
+	for _, k in ipairs(diff.removed) do removedSet[k] = true end
+	diff.addedTop, diff.addedGroup = topMost(diff.added, addedSet, cur.parent)
+	diff.removedTop, diff.removedGroup = topMost(diff.removed, removedSet, prev.parent)
+
+	local deltas = {}
+	local seenClass = {}
+	for cls, n in pairs(curCounts) do
+		seenClass[cls] = true
+		local d = n - (prevCounts[cls] or 0)
+		if d ~= 0 then deltas[#deltas + 1] = { Class = cls, Delta = d, Now = n, Before = prevCounts[cls] or 0 } end
+	end
+	for cls, n in pairs(prevCounts) do
+		if not seenClass[cls] then deltas[#deltas + 1] = { Class = cls, Delta = -n, Now = 0, Before = n } end
+	end
+	table.sort(deltas, function(a, b)
+		if math.abs(a.Delta) ~= math.abs(b.Delta) then return math.abs(a.Delta) > math.abs(b.Delta) end
+		return a.Class < b.Class
+	end)
+	diff.classDeltas = deltas
+	return diff
+end
+
+local function changeReason(oldHash, newHash)
+	local reasons = {}
+	if string.sub(oldHash, 1, 8) ~= string.sub(newHash, 1, 8) then reasons[#reasons + 1] = "attributes/tags" end
+	if string.sub(oldHash, 9, 16) ~= string.sub(newHash, 9, 16) then reasons[#reasons + 1] = "class/properties" end
+	return table.concat(reasons, " + ")
+end
+
+----------------------------------------------------------------------
+-- REPORT BUILDERS
+----------------------------------------------------------------------
+local function renderTree(node, indent, out)
+	local label = indent .. node.name .. " [" .. node.class .. "]"
+	if node.children > 0 then
+		label ..= "  (" .. node.children .. " children, " .. node.desc .. " descendants)"
+	end
+	if node.tagText then label ..= "  tags: " .. node.tagText end
+	if node.attrText then label ..= "  attrs: " .. node.attrText end
+	out[#out + 1] = label
+	for _, gkey in ipairs(node.order) do
+		local g = node.groups[gkey]
+		for _, child in ipairs(g.nodes) do renderTree(child, indent .. "  ", out) end
+		local hidden = g.count - #g.nodes
+		if hidden > 0 then
+			out[#out + 1] = indent .. "  ... +" .. hidden .. " more \"" .. g.name .. "\" [" .. g.class .. "]"
+		end
+	end
+end
+
+local function sortedClassArray()
+	local arr = {}
+	for cls, n in pairs(classHist) do arr[#arr + 1] = { Class = cls, Count = n } end
+	table.sort(arr, function(a, b)
+		if a.Count ~= b.Count then return a.Count > b.Count end
+		return a.Class < b.Class
+	end)
+	return arr
+end
+
+local function jsonPos(p)
+	if type(p) == "table" and p[1] then return string.format("(%s, %s, %s)", tostring(p[1]), tostring(p[2]), tostring(p[3])) end
+	return "?"
+end
+
+----------------------------------------------------------------------
+-- MAIN
+----------------------------------------------------------------------
+local function main()
+	if not HAS.writefile then
+		warn("[Project Zero] writefile() is unavailable - this executor cannot save files. Aborting.")
+		return
+	end
+
+	local t0 = os.clock()
+
+	if CONFIG.WaitForGameLoaded and not game:IsLoaded() then game.Loaded:Wait() end
+	local LocalPlayer = Players.LocalPlayer
+	while not LocalPlayer do
+		yieldNow()
+		LocalPlayer = Players.LocalPlayer
+	end
+	ctx.LocalPlayer = LocalPlayer
+	ctx.playerNames[cleanString(LocalPlayer.Name)] = true
+	ctx.playerNames[cleanString(LocalPlayer.DisplayName)] = true
+
+	if CONFIG.SettleSeconds > 0 then
+		if task and task.wait then task.wait(CONFIG.SettleSeconds) else wait(CONFIG.SettleSeconds) end
+	end
+
+	-- run folder
+	local stamp = os.date("!%Y-%m-%d_%H-%M-%S")
+	local createdUTC = os.date("!%Y-%m-%dT%H:%M:%SZ")
+	local placeId = game.PlaceId
+	local runName = "Run_" .. stamp .. "_P" .. tostring(placeId)
+	local usingFolders = ensureFolder(CONFIG.OutputFolder) and ensureFolder(CONFIG.OutputFolder .. "/" .. runName)
+	local function outPath(file)
+		if usingFolders then return CONFIG.OutputFolder .. "/" .. runName .. "/" .. file end
+		return "ProjectZero_" .. stamp .. "_" .. file
+	end
+
+	print("========================================")
+	print("[Project Zero] " .. VERSION .. " - scan starting")
+	print("========================================")
+
+	state.instStream = newStream(outPath("Instances.jsonl"))
+
+	-- scan every configured service
+	local serviceResults = {}
+	for _, serviceName in ipairs(CONFIG.Services) do
+		local okS, service = pcall(game.GetService, game, serviceName)
+		if not okS or not service then
+			serviceResults[serviceName] = { Available = false, Instances = 0 }
+		elseif serviceName == "Players" then
+			local base = "Players." .. segmentName(LocalPlayer.Name)
+			serviceResults[serviceName] = scanRoot(LocalPlayer, "Players", base, true)
+			serviceResults[serviceName].Note = "local player only (other players are not scanned)"
+		else
+			serviceResults[serviceName] = scanRoot(service, serviceName, serviceName, false)
+		end
+		print(("[Project Zero] %-18s %s instances"):format(serviceName, tostring(serviceResults[serviceName].Instances)))
+	end
+
+	local instOk, instErr = state.instStream.close()
+	local scanSeconds = os.clock() - t0
+
+	-- environment
+	local streamingEnabled = nil
+	pcall(function() streamingEnabled = Workspace.StreamingEnabled end)
+	local workspaceAttrs = getAttributes(Workspace, nil)
+	local mapAttr = nil
+	pcall(function() mapAttr = Workspace:GetAttribute("MAP") end)
+	local playerPos = nil
+	pcall(function()
+		local ch = LocalPlayer.Character
+		if ch then playerPos = serializeValue(ch:GetPivot().Position) end
+	end)
+
+	-- analyzers
+	print("[Project Zero] Running analyzers...")
+	local known = {}
+	for _, p in ipairs(CONFIG.KnownContainers) do known[#known + 1] = containerInfo(p) end
+	local entities, spawns, mapInfo = {}, {}, {}
+	for _, p in ipairs(CONFIG.EntityContainers) do entities[#entities + 1] = summarizeEntities(p) end
+	for _, p in ipairs(CONFIG.SpawnContainers) do spawns[#spawns + 1] = summarizeSpawns(p) end
+	for _, p in ipairs(CONFIG.MapContainers) do mapInfo[#mapInfo + 1] = summarizeMap(p) end
+	local guis = summarizeGuis()
+
+	local classArray = sortedClassArray()
+
+	local topContainers = {}
+	for _, r in ipairs(shallow) do
+		if r.desc > 0 and r.path ~= "Workspace" and not string.find(r.path, "~%d+$") then
+			topContainers[#topContainers + 1] = r
+		end
+	end
+	table.sort(topContainers, function(a, b)
+		if a.desc ~= b.desc then return a.desc > b.desc end
+		return a.path < b.path
+	end)
+
+	local attrArray = {}
+	for name, a in pairs(attrStats) do
+		attrArray[#attrArray + 1] = { Name = name, Count = a.count, ValueType = a.valueType, Sample = a.sample }
+	end
+	table.sort(attrArray, function(a, b)
+		if a.Count ~= b.Count then return a.Count > b.Count end
+		return a.Name < b.Name
+	end)
+
+	local tagArray = {}
+	for tag, t in pairs(tagMap) do tagArray[#tagArray + 1] = { Tag = tag, Count = t.count, Samples = t.samples } end
+	table.sort(tagArray, function(a, b) return a.Tag < b.Tag end)
+
+	local assetArray = {}
+	for id, e in pairs(assetMap) do
+		assetArray[#assetArray + 1] = { Id = id, Count = e.count, Class = e.class, Property = e.prop, Sample = e.sample }
+	end
+	table.sort(assetArray, function(a, b)
+		if a.Count ~= b.Count then return a.Count > b.Count end
+		return a.Id < b.Id
+	end)
+
+	table.sort(scriptList, function(a, b) return a.Path < b.Path end)
+	table.sort(remoteList, function(a, b) return a.Path < b.Path end)
+
+	-- diff vs previous run
+	local diff, prevRun, prevParsed
+	if usingFolders then
+		local run, idxPath = findPreviousRun(runName, placeId)
+		if run then
+			local okR, content = pcall(readfile, idxPath)
+			if okR and type(content) == "string" then
+				print("[Project Zero] Diffing against " .. run .. " ...")
+				prevRun = run
+				prevParsed = parseIndex(content)
+				diff = computeDiff(prevParsed)
+			end
+		end
+	end
+
+	-- ------------------------------------------------------------------
+	-- write files
+	-- ------------------------------------------------------------------
+	local written = {}
+	local function writeText(file, content)
+		local path = outPath(file)
+		local ok, err = pcall(writefile, path, content)
+		written[#written + 1] = { File = file, Path = path, Ok = ok, Err = (not ok) and tostring(err) or nil, Bytes = #content }
+		return ok
+	end
+	written[#written + 1] = { File = "Instances.jsonl", Path = state.instStream.path, Ok = instOk, Err = instErr, Bytes = state.instStream.bytes }
+
+	-- Index.tsv
+	do
+		local idx = newStream(outPath("Index.tsv"))
+		idx.add("#ProjectZeroIndex v2")
+		idx.add("#PlaceId=" .. tostring(placeId))
+		idx.add("#Created=" .. createdUTC)
+		for i, key in ipairs(state.keys) do
+			if i % 20000 == 0 then yieldNow() end
+			idx.add(key .. "\t" .. cur.parent[key] .. "\t" .. cur.class[key] .. "\t" .. cur.hash[key])
+		end
+		local ok, err = idx.close()
+		written[#written + 1] = { File = "Index.tsv", Path = idx.path, Ok = ok, Err = err, Bytes = idx.bytes }
+	end
+
+	-- Tree.txt
+	do
+		local out = {
+			"PROJECT ZERO - HIERARCHY TREE", string.rep("=", 29),
+			"Created: " .. createdUTC,
+			("Depth limit %d; max %d identical Name+Class siblings shown, rest summarized."):format(CONFIG.TreeMaxDepth, CONFIG.TreeGroupLimit),
+			"",
+		}
+		for _, tree in ipairs(state.trees) do
+			renderTree(tree, "", out)
+			out[#out + 1] = ""
+		end
+		writeText("Tree.txt", table.concat(out, "\n"))
+	end
+
+	-- Scripts.txt (no source)
+	do
+		local out = {
+			"PROJECT ZERO - SCRIPT / MODULE MANIFEST", string.rep("=", 39),
+			"Created: " .. createdUTC,
+			"NOTE: source code is intentionally NOT read.",
+			"",
+			("LocalScripts: %d   ModuleScripts: %d   Scripts visible to client: %d"):format(counts.LocalScripts, counts.ModuleScripts, counts.ServerScriptsVisibleToClient),
+			"",
+		}
+		for _, cls in ipairs({ "LocalScript", "ModuleScript", "Script" }) do
+			local group = {}
+			for _, s in ipairs(scriptList) do if s.Class == cls then group[#group + 1] = s end end
+			out[#out + 1] = ("== %s (%d) =="):format(cls, #group)
+			for _, s in ipairs(group) do
+				local extra = ""
+				if s.Disabled == true then extra ..= "  [Disabled]" end
+				if s.RunContext then extra ..= "  [RunContext=" .. tostring(s.RunContext) .. "]" end
+				out[#out + 1] = s.Path .. extra
+			end
+			out[#out + 1] = ""
+		end
+		writeText("Scripts.txt", table.concat(out, "\n"))
+	end
+
+	-- Remotes.txt grouped by container
+	local remoteGroups, remoteGroupOrder = {}, {}
+	for _, r in ipairs(remoteList) do
+		local g = remoteGroups[r.Parent]
+		if not g then
+			g = {}
+			remoteGroups[r.Parent] = g
+			remoteGroupOrder[#remoteGroupOrder + 1] = r.Parent
+		end
+		g[#g + 1] = r
+	end
+	table.sort(remoteGroupOrder)
+	do
+		local out = {
+			"PROJECT ZERO - REMOTE / BINDABLE MANIFEST", string.rep("=", 41),
+			"Created: " .. createdUTC,
+			("RemoteEvents: %d   RemoteFunctions: %d   Bindables: %d"):format(counts.RemoteEvents, counts.RemoteFunctions, counts.Bindables),
+			"",
+		}
+		for _, parent in ipairs(remoteGroupOrder) do
+			local g = remoteGroups[parent]
+			out[#out + 1] = ("== %s (%d) =="):format(parent == "" and "<root>" or parent, #g)
+			for _, r in ipairs(g) do out[#out + 1] = ("  [%s] %s"):format(r.Class, r.Name) end
+			out[#out + 1] = ""
+		end
+		writeText("Remotes.txt", table.concat(out, "\n"))
+	end
+
+	-- Tags.txt
+	do
+		local out = { "PROJECT ZERO - COLLECTION TAGS", string.rep("=", 30), "Created: " .. createdUTC, "" }
+		for _, t in ipairs(tagArray) do
+			out[#out + 1] = ("[%s]  %d instance(s)"):format(t.Tag, t.Count)
+			for _, p in ipairs(t.Samples) do out[#out + 1] = "  " .. p end
+			if t.Count > #t.Samples then out[#out + 1] = "  ... +" .. (t.Count - #t.Samples) .. " more" end
+			out[#out + 1] = ""
+		end
+		if #tagArray == 0 then out[#out + 1] = "(no tags found)" end
+		writeText("Tags.txt", table.concat(out, "\n"))
+	end
+
+	-- Assets.txt
+	do
+		local out = { "PROJECT ZERO - ASSET IDS", string.rep("=", 24), "Created: " .. createdUTC,
+			("Distinct assets: %d%s"):format(#assetArray, assetKeyCount >= CONFIG.MaxAssets and " (cap reached)" or ""), "" }
+		for _, a in ipairs(assetArray) do
+			out[#out + 1] = ("%s   x%d   %s.%s   e.g. %s"):format(a.Id, a.Count, a.Class, a.Property, a.Sample)
+		end
+		writeText("Assets.txt", table.concat(out, "\n"))
+	end
+
+	-- Diff.txt
+	local diffHeadline = "No previous run found for this PlaceId - this snapshot is your baseline."
+	if diff then
+		local lim = CONFIG.DiffListLimit
+		local out = {
+			"PROJECT ZERO - CHANGES SINCE LAST RUN", string.rep("=", 37),
+			"Previous: " .. prevRun,
+			"Current:  " .. runName,
+			("Added: %d   Removed: %d   Changed: %d   (ignored dynamic keys: %d)"):format(#diff.added, #diff.removed, #diff.changed, diff.ignored),
+			"Ignored prefixes: " .. table.concat(CONFIG.DiffIgnorePrefixes, ", "),
+			"",
+		}
+		if state.truncated then out[#out + 1] = "WARNING: current scan hit MaxInstances; the REMOVED list was skipped.\n" end
+
+		out[#out + 1] = "== CLASS COUNT DELTAS (top 25, dynamic areas excluded) =="
+		for i = 1, math.min(25, #diff.classDeltas) do
+			local d = diff.classDeltas[i]
+			out[#out + 1] = ("  %-28s %+d   (%d -> %d)"):format(d.Class, d.Delta, d.Before, d.Now)
+		end
+		if #diff.classDeltas == 0 then out[#out + 1] = "  (none)" end
+		out[#out + 1] = ""
+
+		out[#out + 1] = ("== ADDED (%d top-most, %d total) =="):format(#diff.addedTop, #diff.added)
+		for i = 1, math.min(lim, #diff.addedTop) do
+			local k = diff.addedTop[i]
+			local n = diff.addedGroup[k]
+			out[#out + 1] = ("  + %s [%s]%s"):format(k, cur.class[k], n > 1 and ("  (+" .. n .. " instances)") or "")
+		end
+		if #diff.addedTop > lim then out[#out + 1] = "  ... and " .. (#diff.addedTop - lim) .. " more (see Instances.jsonl)" end
+		out[#out + 1] = ""
+
+		out[#out + 1] = ("== REMOVED (%d top-most, %d total) =="):format(#diff.removedTop, #diff.removed)
+		for i = 1, math.min(lim, #diff.removedTop) do
+			local k = diff.removedTop[i]
+			local n = diff.removedGroup[k]
+			out[#out + 1] = ("  - %s%s"):format(k, n > 1 and ("  (-" .. n .. " instances)") or "")
+		end
+		if #diff.removedTop > lim then out[#out + 1] = "  ... and " .. (#diff.removedTop - lim) .. " more" end
+		out[#out + 1] = ""
+
+		out[#out + 1] = ("== CHANGED (%d) =="):format(#diff.changed)
+		for i = 1, math.min(lim, #diff.changed) do
+			local k = diff.changed[i]
+			local reason = prevParsed and changeReason(prevParsed.hash[k], cur.hash[k]) or "changed"
+			out[#out + 1] = ("  ~ %s [%s]  %s"):format(k, cur.class[k], reason)
+		end
+		if #diff.changed > lim then out[#out + 1] = "  ... and " .. (#diff.changed - lim) .. " more" end
+
+		writeText("Diff.txt", table.concat(out, "\n"))
+		diffHeadline = ("vs %s: +%d added, -%d removed, ~%d changed (see Diff.txt)"):format(prevRun, #diff.added, #diff.removed, #diff.changed)
+	end
+
+	-- Snapshot.json
+	local displayPlayer = {
+		Name = CONFIG.RedactPlayerInfo and "<redacted>" or LocalPlayer.Name,
+		DisplayName = CONFIG.RedactPlayerInfo and "<redacted>" or LocalPlayer.DisplayName,
+		UserId = CONFIG.RedactPlayerInfo and 0 or LocalPlayer.UserId,
+		Position = playerPos,
+	}
+	local diffJson = nil
+	if diff then
+		local function head(list, n)
+			local o = {}
+			for i = 1, math.min(n, #list) do o[i] = list[i] end
+			return o
+		end
+		diffJson = {
+			PreviousRun = prevRun, Added = #diff.added, Removed = #diff.removed, Changed = #diff.changed, IgnoredKeys = diff.ignored,
+			AddedTop = head(diff.addedTop, 100), RemovedTop = head(diff.removedTop, 100), ChangedSample = head(diff.changed, 100),
+			ClassDeltas = head(diff.classDeltas, 50),
+		}
+	end
+
+	local snapshot = {
+		ExtractorVersion = VERSION,
+		CreatedUTC = createdUTC,
+		RunName = runName,
+		Game = {
+			PlaceId = game.PlaceId, GameId = game.GameId, JobId = game.JobId,
+			PlaceVersion = (function() local ok, v = pcall(index, game, "PlaceVersion") return ok and v or nil end)(),
+		},
+		Player = displayPlayer,
+		Environment = { MAP = mapAttr, StreamingEnabled = streamingEnabled, WorkspaceAttributes = workspaceAttrs },
+		Scan = {
+			Instances = state.count, Truncated = state.truncated, MaxInstances = CONFIG.MaxInstances,
+			SkippedPlayerCharacters = state.skippedCharacters, RecordErrors = state.recordErrors,
+			JsonErrors = state.jsonErrors, ErrorSamples = state.errorSamples,
+			Seconds = round3(scanSeconds),
+		},
+		Services = serviceResults,
+		Counts = counts,
+		ClassHistogram = classArray,
+		TopContainers = (function()
+			local o = {}
+			for i = 1, math.min(CONFIG.TopContainers, #topContainers) do
+				o[i] = { Path = topContainers[i].path, Class = topContainers[i].class, Children = topContainers[i].children, Descendants = topContainers[i].desc }
+			end
+			return o
+		end)(),
+		KnownContainers = known,
+		Entities = entities,
+		Spawns = spawns,
+		Map = mapInfo,
+		Guis = guis,
+		AttributeNames = attrArray,
+		Remotes = remoteList,
+		Scripts = scriptList,
+		Tags = tagArray,
+		Assets = (function()
+			local o = {}
+			for i = 1, math.min(CONFIG.TopAssetsInJson, #assetArray) do o[i] = assetArray[i] end
+			return o
+		end)(),
+		Diff = diffJson,
+		Notes = {
+			"Metadata/structure only. Script/LocalScript/ModuleScript Source is never read, so logic changes inside scripts cannot be detected.",
+			"Only client-replicated instances exist here; server-only objects are invisible.",
+			"With StreamingEnabled the workspace only contains content streamed near the player; compare snapshots from the same spot.",
+			"Fingerprints exclude volatile data (health, GUI state, unanchored part transforms) and round numbers to 3 decimals.",
+			"Instance keys are dotted paths; duplicate sibling names are suffixed ~2, ~3, ...",
+		},
+	}
+	do
+		local text, err = encodeJSON(snapshot)
+		if text then
+			writeText("Snapshot.json", text)
+		else
+			warn("[Project Zero] Snapshot.json encode failed: " .. tostring(err))
+			written[#written + 1] = { File = "Snapshot.json", Path = outPath("Snapshot.json"), Ok = false, Err = tostring(err), Bytes = 0 }
+		end
+	end
+
+	-- Summary.txt
+	do
+		local S = {}
+		local function add(s) S[#S + 1] = s end
+		local function head(title)
+			add("")
+			add(title)
+			add(string.rep("-", #title))
+		end
+
+		add("PROJECT ZERO - GAME STRUCTURE SNAPSHOT")
+		add("======================================")
+		add("Extractor: " .. VERSION)
+		add("Created:   " .. createdUTC .. "   (scan " .. string.format("%.1f", scanSeconds) .. "s)")
+		add("Run:       " .. runName)
+
+		local warnings = {}
+		if streamingEnabled then warnings[#warnings + 1] = "StreamingEnabled is ON: Workspace content is partial and depends on where the player stands. Always snapshot from the same spot." end
+		if state.truncated then warnings[#warnings + 1] = "Scan hit MaxInstances (" .. CONFIG.MaxInstances .. "): data is incomplete." end
+		if state.recordErrors > 0 then warnings[#warnings + 1] = state.recordErrors .. " instance(s) failed to record (see Snapshot.json -> Scan.ErrorSamples)." end
+		if state.jsonErrors > 0 then warnings[#warnings + 1] = state.jsonErrors .. " record(s) could not be JSON-encoded." end
+		if not usingFolders then warnings[#warnings + 1] = "Folder API unavailable: files were written flat and diffing is disabled." end
+		if #warnings > 0 then
+			head("WARNINGS")
+			for _, w in ipairs(warnings) do add("! " .. w) end
+		end
+
+		head("CHANGES")
+		add(diffHeadline)
+
+		head("GAME")
+		add("PlaceId: " .. tostring(game.PlaceId) .. "   GameId: " .. tostring(game.GameId))
+		add("JobId: " .. tostring(game.JobId))
+		add("MAP attribute: " .. tostring(mapAttr) .. "   StreamingEnabled: " .. tostring(streamingEnabled))
+		if not CONFIG.RedactPlayerInfo then
+			add("Player: " .. LocalPlayer.Name .. " (" .. LocalPlayer.UserId .. ")   position: " .. jsonPos(playerPos))
+		end
+
+		head("SCAN")
+		add(("Instances: %d   Skipped player characters: %d"):format(state.count, state.skippedCharacters))
+		for _, name in ipairs(CONFIG.Services) do
+			local r = serviceResults[name]
+			add(("  %-18s %-12s %d instances"):format(name, r.Available and "available" or "unavailable", r.Instances or 0))
+		end
+
+		head("COUNTS")
+		for _, k in ipairs(sortedKeys(counts)) do add(("  %-30s %d"):format(k, counts[k])) end
+
+		head("TOP CLASSES")
+		for i = 1, math.min(CONFIG.TopClasses, #classArray) do
+			add(("  %-30s %d"):format(classArray[i].Class, classArray[i].Count))
+		end
+
+		head("LARGEST CONTAINERS (by descendants)")
+		for i = 1, math.min(CONFIG.TopContainers, #topContainers) do
+			local r = topContainers[i]
+			add(("  %8d  %s [%s]"):format(r.desc, r.path, r.class))
+		end
+
+		head("KNOWN CONTAINERS")
+		for _, k in ipairs(known) do
+			if k.Exists then
+				add(("  [OK] %s [%s]  children=%d  descendants=%s"):format(k.Path, k.Class, k.Children, tostring(k.Descendants)))
+			else
+				add("  [--] " .. k.Path .. "  (not found)")
+			end
+		end
+
+		head("ENTITIES")
+		for _, e in ipairs(entities) do
+			if e.Exists then
+				add(("%s: %d children, %d distinct names"):format(e.Path, e.TotalChildren, e.DistinctNames))
+				for i = 1, math.min(40, #e.Groups) do
+					local g = e.Groups[i]
+					add(("  x%-3d %s [%s]  hp=%s  at %s"):format(g.Count, g.Name, g.Class, tostring(g.MaxHealth), jsonPos(g.Position)))
+				end
+				if #e.Groups > 40 then add("  ... +" .. (#e.Groups - 40) .. " more (see Snapshot.json)") end
+			else
+				add(e.Path .. ": not found")
+			end
+		end
+
+		head("SPAWN POINTS")
+		for _, s in ipairs(spawns) do
+			if s.Exists then
+				add(("%s: %d spawns, %d distinct names"):format(s.Path, s.TotalChildren, s.DistinctNames))
+				for i = 1, math.min(40, #s.Groups) do
+					local g = s.Groups[i]
+					add(("  x%-3d %s  first at %s"):format(g.Count, g.Name, jsonPos(g.Positions[1])))
+				end
+			else
+				add(s.Path .. ": not found")
+			end
+		end
+
+		head("MAP / ISLANDS")
+		for _, m in ipairs(mapInfo) do
+			if m.Exists then
+				add(("%s: %d children"):format(m.Path, m.TotalChildren))
+				for i = 1, math.min(60, #m.Entries) do
+					local e = m.Entries[i]
+					add(("  %s [%s]  desc=%s  at %s  size %s"):format(e.Name, e.Class, tostring(e.Descendants), jsonPos(e.Position), jsonPos(e.Size)))
+				end
+			else
+				add(m.Path .. ": not found")
+			end
+		end
+
+		head("PLAYER GUIS")
+		for _, g in ipairs(guis) do
+			add(("  %s [%s]  enabled=%s  descendants=%s"):format(g.Name, g.Class, tostring(g.Enabled), tostring(g.Descendants)))
+		end
+
+		head("REMOTES BY CONTAINER")
+		for _, parent in ipairs(remoteGroupOrder) do
+			add(("  %4d  %s"):format(#remoteGroups[parent], parent == "" and "<root>" or parent))
+		end
+
+		head("ATTRIBUTES (top 25 names)")
+		for i = 1, math.min(25, #attrArray) do
+			local a = attrArray[i]
+			add(("  %-28s x%d  (%s)  e.g. %s"):format(a.Name, a.Count, a.ValueType, a.Sample))
+		end
+
+		head("OUTPUT FILES")
+		for _, w in ipairs(written) do
+			add(("  [%s] %s (%d bytes)%s"):format(w.Ok and "ok" or "FAILED", w.Path, w.Bytes or 0, w.Err and ("  " .. w.Err) or ""))
+		end
+
+		writeText("Summary.txt", table.concat(S, "\n"))
+	end
+
+	-- console report
+	print("========================================")
+	print("[Project Zero] Complete in " .. string.format("%.1f", os.clock() - t0) .. "s")
+	print(("  Instances: %d   Scripts: %d   Remotes: %d   Assets: %d"):format(state.count, counts.Scripts, #remoteList, #assetArray))
+	print("  MAP: " .. tostring(mapAttr) .. "   StreamingEnabled: " .. tostring(streamingEnabled))
+	print("  " .. diffHeadline)
+	for _, w in ipairs(written) do
+		print(("  [%s] %s"):format(w.Ok and "ok" or "FAILED", w.Path))
+		if not w.Ok then warn("    " .. tostring(w.Err)) end
+	end
+	if streamingEnabled then
+		warn("[Project Zero] StreamingEnabled is ON - the Workspace snapshot is partial / position-dependent.")
+	end
+	print("========================================")
+end
+
+----------------------------------------------------------------------
+-- RUN (guarded so a double-execute can't run two scans at once)
+----------------------------------------------------------------------
+local genv = (type(getgenv) == "function") and getgenv() or nil
+if genv and genv.__ProjectZeroExtractorRunning then
+	warn("[Project Zero] Extractor is already running.")
+else
+	if genv then genv.__ProjectZeroExtractorRunning = true end
+	local ok, err = xpcall(main, function(e) return debug.traceback(tostring(e), 2) end)
+	if genv then genv.__ProjectZeroExtractorRunning = false end
+	if not ok then
+		warn("[Project Zero] Extractor crashed:\n" .. tostring(err))
+	end
+end
